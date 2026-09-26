@@ -39,6 +39,21 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 
 	private (int Count, ulong Size)? _fileStats;
 
+	/// <summary>
+	///     <see cref="OpenFile(InnoArchiveFile)" /> 最近使用的 chunk 解码器（流释放后归还）：
+	///     按数据顺序连续打开同一 chunk 的文件时从当前位置续读，而非每次从 chunk 起点重新解码
+	///     （固体包逐文件打开由 O(n²) 降为 O(n)）。
+	/// </summary>
+	private ChunkCursor? _cachedCursor;
+
+	/// <summary>
+	///     共享切片读取器 <see cref="_slices" /> 的使用版本：每次在其上打开新 chunk 时递增。
+	///     切片读取器位置为共享状态，版本不一致的缓存解码器已失去其读取位置，不可续读。
+	/// </summary>
+	private int _slicesVersion;
+
+	private volatile bool _disposed;
+
 	private InnoSetupArchive(
 		Stream stream,
 		bool leaveOpen,
@@ -77,6 +92,8 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 	}
 
 	public void Dispose() {
+		_disposed = true;
+		Interlocked.Exchange(ref _cachedCursor, null)?.Chunk.Dispose();
 		_hashPoolMd5?.Dispose();
 		_hashPoolSha1?.Dispose();
 		_hashPoolSha256?.Dispose();
@@ -361,6 +378,13 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 	/// <summary>
 	///     打开文件的解压数据流（调用方负责释放）。
 	/// </summary>
+	/// <remarks>
+	///     流释放后其 chunk 解码器被缓存：下一次打开同一 chunk 中位于其后的文件时从当前位置续读，
+	///     无需从 chunk 起点重新解码。因此按数据顺序（固体包中通常即 <see cref="EnumerateFiles()" /> 顺序）
+	///     逐个打开并释放全部文件的总解码量与 <see cref="ExtractToDirectory" /> 相当；
+	///     打开位于已读位置之前的文件时回退为从 chunk 起点解码。
+	///     缓存的解码器（含 LZMA 字典）保留至下一次无法续读的打开或 archive 释放。
+	/// </remarks>
 	/// <exception cref="InnoUnsupportedException">文件数据已加密且未提供密码。</exception>
 	public Stream OpenFile(InnoArchiveFile file) {
 		ArgumentNullException.ThrowIfNull(file);
@@ -368,22 +392,51 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 			throw new ArgumentException("文件条目不属于当前安装包", nameof(file));
 		}
 
-		var chunk = ChunkReader.Open(_slices, file.DataEntry, _crypto);
+		ObjectDisposedException.ThrowIf(_disposed, this);
+
+		var data = file.DataEntry;
+		var fileOffset = (long)data.FileOffset;
+		var cursor = Interlocked.Exchange(ref _cachedCursor, null);
+		if (cursor is not null && !cursor.CanContinueTo(data, fileOffset, Volatile.Read(ref _slicesVersion))) {
+			cursor.Chunk.Dispose();
+			cursor = null;
+		}
+
+		if (cursor is null) {
+			var version = Interlocked.Increment(ref _slicesVersion);
+			cursor = new(this, ChunkReader.Open(_slices, data, _crypto), data.FirstSlice, data.Offset, version);
+		}
+
 		try {
-			if (file.DataEntry.FileOffset > 0) {
-				SkipBytes(chunk.Stream, (long)file.DataEntry.FileOffset);
+			if (fileOffset > cursor.Position) {
+				SkipBytes(cursor.Chunk.Stream, fileOffset - cursor.Position);
+				cursor.Position = fileOffset;
 			}
 
-			Stream stream = new FileSliceStream(chunk.Stream, chunk, (long)file.DataEntry.FileSize);
-			if ((file.DataEntry.Options & InnoDataOptions.CallInstructionOptimized) != 0) {
+			Stream stream = new FileSliceStream(cursor.Chunk.Stream, cursor, (long)data.FileSize);
+			if ((data.Options & InnoDataOptions.CallInstructionOptimized) != 0) {
 				// 反转调用指令优化（4.1.8+ 默认启用），还原原始可执行文件
 				stream = ExeFilterStream.Create(stream, FilterModeFor(Info.Version));
 			}
 
 			return stream;
 		} catch {
-			chunk.Dispose();
+			cursor.Chunk.Dispose();
 			throw;
+		}
+	}
+
+	/// <summary>归还 <see cref="OpenFile(InnoArchiveFile)" /> 流释放后的 chunk 解码器（替换并释放先前缓存的解码器）。</summary>
+	private void ReturnCursor(ChunkCursor cursor) {
+		if (_disposed) {
+			cursor.Chunk.Dispose();
+			return;
+		}
+
+		Interlocked.Exchange(ref _cachedCursor, cursor)?.Chunk.Dispose();
+		if (_disposed) {
+			// 与 Dispose 竞争：确保缓存不残留
+			Interlocked.Exchange(ref _cachedCursor, null)?.Chunk.Dispose();
 		}
 	}
 
@@ -611,7 +664,8 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 		// 目录创建缓存：同一提取批次内已确认存在的目录跳过重复 CreateDirectory（15365 文件级联调用场景可省数万次 syscall）
 		var dirCache = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
 		if (parallelism <= 1 || groups.Count <= 1 || _sliceReaderFactory is null) {
-			// 串行路径（默认）：逐组顺序提取
+			// 串行路径（默认）：逐组顺序提取；共享切片读取器位置将被移动，使缓存的 OpenFile 解码器失效
+			Interlocked.Increment(ref _slicesVersion);
 			long extracted = 0;
 			var filesExtracted = 0;
 			foreach (var group in groups) {
@@ -960,11 +1014,37 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 	}
 
 	/// <summary>
-	///     限制读取范围的文件数据流（chunk 为 null 时不持有 chunk 所有权，
-	///     供按 chunk 批量提取时共享同一解压流使用）。
+	///     <see cref="OpenFile(InnoArchiveFile)" /> 的 chunk 解码器及其已解码位置（解压数据内偏移）。
 	/// </summary>
-	sealed private class FileSliceStream(Stream inner, ChunkReader? chunk, long length) : Stream {
+	sealed private class ChunkCursor(
+		InnoSetupArchive owner,
+		ChunkReader chunk,
+		uint firstSlice,
+		ulong offset,
+		int slicesVersion) {
+		public ChunkReader Chunk { get; } = chunk;
+
+		/// <summary>已从解压流读取的字节数。</summary>
+		public long Position { get; set; }
+
+		/// <summary>解码器是否可续读到指定数据条目（同一 chunk、目标不早于当前位置、切片读取器未被他处移动）。</summary>
+		public bool CanContinueTo(InnoDataEntry data, long fileOffset, int currentSlicesVersion) =>
+			data.FirstSlice == firstSlice
+			&& data.Offset == offset
+			&& fileOffset >= Position
+			&& slicesVersion == currentSlicesVersion;
+
+		public void Return() { owner.ReturnCursor(this); }
+	}
+
+	/// <summary>
+	///     限制读取范围的文件数据流（cursor 为 null 时不持有 chunk 所有权，
+	///     供按 chunk 批量提取时共享同一解压流使用；否则释放时累计已读位置并归还解码器）。
+	/// </summary>
+	sealed private class FileSliceStream(Stream inner, ChunkCursor? cursor, long length) : Stream {
 		private long _remaining = length;
+		private ChunkCursor? _cursor = cursor;
+		private long _consumed;
 
 		public override bool CanRead => true;
 		public override bool CanSeek => false;
@@ -973,16 +1053,7 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 		public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
 		public override void Flush() { }
 
-		public override int Read(byte[] buffer, int offset, int count) {
-			if (_remaining <= 0) {
-				return 0;
-			}
-
-			count = (int)Math.Min(count, _remaining);
-			var n = inner.Read(buffer, offset, count);
-			_remaining -= n;
-			return n;
-		}
+		public override int Read(byte[] buffer, int offset, int count) { return Read(buffer.AsSpan(offset, count)); }
 
 		public override int Read(Span<byte> buffer) {
 			if (_remaining <= 0) {
@@ -993,8 +1064,18 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 				buffer = buffer[..(int)_remaining];
 			}
 
-			var n = inner.Read(buffer);
+			int n;
+			try {
+				n = inner.Read(buffer);
+			} catch {
+				// 解码失败：解码器状态不可信，释放而非归还缓存
+				_cursor?.Chunk.Dispose();
+				_cursor = null;
+				throw;
+			}
+
 			_remaining -= n;
+			_consumed += n;
 			return n;
 		}
 
@@ -1005,8 +1086,10 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 		public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
 
 		override protected void Dispose(bool disposing) {
-			if (disposing) {
-				chunk?.Dispose();
+			if (disposing && _cursor is { } owned) {
+				_cursor = null;
+				owned.Position += _consumed;
+				owned.Return();
 			}
 
 			base.Dispose(disposing);

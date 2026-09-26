@@ -1,4 +1,5 @@
 using InnoUnpack.NET;
+using InnoUnpack.NET.Metadata;
 
 namespace InnoUnpack.Tests;
 
@@ -24,6 +25,84 @@ public class ApiTests {
 		using var ms = new MemoryStream();
 		stream.CopyTo(ms);
 		Assert.Equal((long)first.Size, ms.Length);
+	}
+
+	[Theory]
+	[InlineData("isetup-4.2.7.exe")]
+	[InlineData("innosetup-5.5.9-unicode.exe")]
+	[InlineData("innosetup-5.6.1-unicode.exe")]
+	[InlineData("innosetup-6.7.3.exe")]
+	[InlineData("innosetup-7.0.2-x64.exe")]
+	public void OpenFileSequentialReadsMatchChecksums(string fixture) {
+		Fixtures.SkipIfMissing(fixture);
+
+		using var archive = InnoSetupArchive.Open(Fixtures.Get(fixture));
+		List<InnoArchiveFile> files = [.. archive.EnumerateFiles()];
+
+		// 顺序（复用缓存解码器续读）、逆序（每次回退重开 chunk）与交错部分读取均应得到正确内容
+		foreach (var file in files) {
+			AssertContentMatchesChecksum(archive, file);
+		}
+
+		for (var i = files.Count - 1; i >= 0; i--) {
+			AssertContentMatchesChecksum(archive, files[i]);
+		}
+
+		for (var i = 0; i < files.Count; i++) {
+			if (i % 2 == 0) {
+				// 只读取部分数据即释放：下一次打开应从正确位置续读
+				using var partial = archive.OpenFile(files[i]);
+				partial.ReadExactly(new byte[(int)Math.Min(files[i].Size, 100)]);
+			} else {
+				AssertContentMatchesChecksum(archive, files[i]);
+			}
+		}
+	}
+
+	[Fact]
+	public void OpenFileAfterExtractionReadsCorrectData() {
+		Fixtures.SkipIfMissing("innosetup-6.7.3.exe");
+
+		using var archive = InnoSetupArchive.Open(Fixtures.Get("innosetup-6.7.3.exe"));
+		List<InnoArchiveFile> files = [.. archive.EnumerateFiles()];
+		var outputDir = Path.Combine(Path.GetTempPath(), "innounpack-tests", "openfile-after-extract");
+		try {
+			// 缓存解码器之后的提取会移动共享切片读取器位置，缓存应失效而非读出错误数据
+			AssertContentMatchesChecksum(archive, files[0]);
+			archive.ExtractFile(files[^1].Path, outputDir);
+			AssertContentMatchesChecksum(archive, files[1]);
+		} finally {
+			if (Directory.Exists(outputDir)) {
+				Directory.Delete(outputDir, true);
+			}
+		}
+	}
+
+	[Fact]
+	public void OpenFileAfterDisposeThrows() {
+		Fixtures.SkipIfMissing("innosetup-6.7.3.exe");
+
+		var archive = InnoSetupArchive.Open(Fixtures.Get("innosetup-6.7.3.exe"));
+		var file = archive.EnumerateFiles().First();
+		var stream = archive.OpenFile(file);
+		archive.Dispose();
+		stream.Dispose(); // archive 释放后归还解码器不应抛出
+		Assert.Throws<ObjectDisposedException>(() => archive.OpenFile(file));
+	}
+
+	static private void AssertContentMatchesChecksum(InnoSetupArchive archive, InnoArchiveFile file) {
+		using var stream = archive.OpenFile(file);
+		using var hasher = FileHasher.Create(file.DataEntry.Checksum.Type);
+		var buffer = new byte[81920];
+		long total = 0;
+		int n;
+		while ((n = stream.Read(buffer, 0, buffer.Length)) > 0) {
+			hasher?.Update(buffer.AsSpan(0, n));
+			total += n;
+		}
+
+		Assert.Equal((long)file.Size, total);
+		Assert.True(hasher is null || hasher.Verify(file.DataEntry.Checksum), $"校验和不匹配：{file.Path}");
 	}
 
 	[Fact]
