@@ -677,6 +677,9 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 		var chunk = ChunkReader.Open(slices, chunkFiles[0].DataEntry, _crypto, options.MaxParallelism);
 		var chunkStream = chunk.Stream;
 		long chunkPos = 0;
+		// 最近写出的文件及其数据条目（重复引用同一数据的后续条目直接复制）
+		InnoDataEntry? lastDataEntry = null;
+		string? lastTarget = null;
 		// 提取缓冲：整个 chunk 批次复用一份（解压+写盘共用），ArrayPool 租用避免每批次分配
 		var buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
 		try {
@@ -692,16 +695,16 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 					continue;
 				}
 
-				var target = ResolveOutputPath(outputRoot, file.Path);
-				if (target is not null && options.OutputPathMapper is not null) {
-					var mapped = options.OutputPathMapper(file);
-					if (!string.IsNullOrEmpty(mapped)) {
-						// 映射路径同样需通过安全校验，不安全时回退默认路径
-						target = ResolveOutputPath(outputRoot, mapped) ?? target;
-					}
+				// 映射优先：默认路径不安全（如绝对目标路径 C:\...）的文件也可由映射重定向到输出目录内；
+				// 映射结果不安全时回退默认路径
+				string? target = null;
+				if (options.OutputPathMapper?.Invoke(file) is { Length: > 0 } mapped) {
+					target = ResolveOutputPath(outputRoot, mapped);
 				}
 
+				target ??= ResolveOutputPath(outputRoot, file.Path);
 				if (target is null) {
+					options.RaiseUnsafePathSkipped(file);
 					AddProgress(options, parallel, ref extracted, ref filesExtracted, 0, 1, file.Path); // 不安全路径，跳过
 					continue;
 				}
@@ -715,6 +718,22 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 
 				// 定位到文件数据起点：组内偏移递增，只需前跳
 				var fileOffset = (long)file.DataEntry.FileOffset;
+				if (ReferenceEquals(file.DataEntry, lastDataEntry) && lastTarget is not null) {
+					// 多个文件条目引用同一数据（如同一源文件安装到多个目录）：复制刚写出的文件，
+					// 避免回退重开 chunk 从头解码
+					if (!string.Equals(lastTarget, target, StringComparison.Ordinal)) {
+						File.Copy(lastTarget, target, overwrite: true);
+					}
+
+					AddProgress(options, parallel, ref extracted, ref filesExtracted, (long)file.Size, 1, file.Path);
+					SetTimestamp(target, file.Timestamp, options);
+					if (options.ApplyFileAttributes) {
+						ApplyFileAttributes(target, file);
+					}
+
+					continue;
+				}
+
 				if (fileOffset < chunkPos) {
 					// 防御：偏移回退（如同一数据被多个文件条目引用），重新打开 chunk
 					chunk.Dispose();
@@ -762,6 +781,8 @@ public sealed class InnoSetupArchive : IDisposable, IAsyncDisposable {
 				}
 
 				chunkPos += (long)file.Size;
+				lastDataEntry = file.DataEntry;
+				lastTarget = target;
 				AddProgress(options, parallel, ref extracted, ref filesExtracted, 0, 1, file.Path);
 				SetTimestamp(target, file.Timestamp, options);
 				if (options.ApplyFileAttributes) {

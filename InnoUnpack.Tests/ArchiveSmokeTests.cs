@@ -430,6 +430,91 @@ public class ArchiveSmokeTests {
 				: null;
 	}
 
+	[Fact]
+	public void RootedPathIsReportedOrMapped() {
+		Fixtures.SkipIfMissing("innosetup-6.7.3.exe");
+
+		using var archive = InnoSetupArchive.Open(Fixtures.Get("innosetup-6.7.3.exe"));
+		var source = archive.EnumerateFiles().First(f => f.Size > 0);
+		// 官方安装包无绝对目标路径条目：以真实数据条目构造一个（DestDir: "C:\..." 展开后即为绝对路径）
+		var rootedPath = Path.Combine(Path.GetTempPath(), "innounpack-tests", "rooted-target", "abs.bin");
+		var rooted = WithPath(source, rootedPath);
+
+		var outputDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "innounpack-tests", "rooted-output"));
+		if (Directory.Exists(outputDir)) {
+			Directory.Delete(outputDir, true);
+		}
+
+		Directory.CreateDirectory(outputDir);
+		try {
+			// 无映射：不写出（输出目录内外均无），并通过事件报告
+			List<InnoArchiveFile> skipped = [];
+			var options = new ExtractionOptions();
+			options.UnsafePathSkipped += skipped.Add;
+			archive.ExtractByChunk([rooted], outputDir, options);
+			Assert.Same(rooted, Assert.Single(skipped));
+			Assert.False(File.Exists(rootedPath));
+			Assert.Empty(Directory.EnumerateFiles(outputDir, "*", SearchOption.AllDirectories));
+
+			// 有映射：映射对绝对路径条目同样调用，文件写入输出目录内
+			skipped.Clear();
+			options = new ExtractionOptions { OutputPathMapper = f => ReferenceEquals(f, rooted) ? "mapped/abs.bin" : null };
+			options.UnsafePathSkipped += skipped.Add;
+			archive.ExtractByChunk([rooted], outputDir, options);
+			Assert.Empty(skipped);
+			Assert.Equal((long)source.Size, new FileInfo(Path.Combine(outputDir, "mapped", "abs.bin")).Length);
+			Assert.False(File.Exists(rootedPath));
+		} finally {
+			if (Directory.Exists(outputDir)) {
+				Directory.Delete(outputDir, true);
+			}
+		}
+	}
+
+	[Fact]
+	public void DuplicateDataEntriesAreAllExtracted() {
+		Fixtures.SkipIfMissing("innosetup-6.7.3.exe");
+
+		using var archive = InnoSetupArchive.Open(Fixtures.Get("innosetup-6.7.3.exe"));
+		List<InnoArchiveFile> files = [.. archive.EnumerateFiles()];
+		// 同一源文件安装到两个目录：两个文件条目引用同一数据条目
+		var source = files[files.Count / 2];
+		var duplicate = WithPath(source, "duplicate/" + Path.GetFileName(source.Path));
+		files.Add(duplicate);
+
+		var outputDir = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "innounpack-tests", "duplicate-data"));
+		if (Directory.Exists(outputDir)) {
+			Directory.Delete(outputDir, true);
+		}
+
+		Directory.CreateDirectory(outputDir);
+		try {
+			// 全部文件均校验校验和：重复条目之后的文件仍从正确的 chunk 位置读取
+			var (_, filesExtracted) = archive.ExtractByChunk(files, outputDir, new ExtractionOptions());
+			Assert.Equal(files.Count, filesExtracted);
+			Assert.Equal(
+				File.ReadAllBytes(Path.Combine(outputDir, source.Path)),
+				File.ReadAllBytes(Path.Combine(outputDir, duplicate.Path)));
+		} finally {
+			if (Directory.Exists(outputDir)) {
+				Directory.Delete(outputDir, true);
+			}
+		}
+	}
+
+	/// <summary>以相同数据条目构造不同输出路径的文件条目。</summary>
+	static private InnoArchiveFile WithPath(InnoArchiveFile file, string path) =>
+		new() {
+			SourceName = file.SourceName,
+			Destination = file.Destination,
+			Path = path,
+			Size = file.Size,
+			Timestamp = file.Timestamp,
+			Entry = file.Entry,
+			DataEntry = file.DataEntry,
+			Owner = file.Owner
+		};
+
 	[Theory]
 	[InlineData("isetup-4.2.7.exe")]
 	[InlineData("innosetup-6.7.3.exe")]

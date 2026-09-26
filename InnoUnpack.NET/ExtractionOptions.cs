@@ -48,6 +48,8 @@ public sealed class ExtractionOptions {
 
 	/// <summary>
 	///     输出路径映射：返回替换默认输出路径的相对路径（可含子目录或重命名），null 表示使用默认路径。
+	///     对每个待提取文件调用（先于默认路径校验），因此默认路径不安全的文件（如安装到绝对路径
+	///     <c>C:\...</c> 的条目，其 <see cref="InnoArchiveFile.Path" /> 为绝对路径）也可由映射重定向到输出目录内。
 	///     映射结果同样经过路径安全校验；不安全（绝对路径或逃逸输出目录）时回退默认路径。
 	///     与 <see cref="InnoOpenOptions.PathMappings" /> 的区别：后者在打开时作用于 {app} 等常量，
 	///     本映射在提取时作用于已展开的每个文件（可与 <see cref="FileFilter" /> 组合实现"只提取
@@ -57,6 +59,14 @@ public sealed class ExtractionOptions {
 
 	/// <summary>提取进度事件（绝对进度，同步触发）。</summary>
 	public event Action<ExtractionProgress>? ProgressChanged;
+
+	/// <summary>
+	///     因输出路径不安全（绝对路径或逃逸输出目录，且 <see cref="OutputPathMapper" /> 未提供安全路径）
+	///     而未提取的文件（同步触发；并行提取时可能在多个线程触发）。
+	///     安装到绝对路径（如 <c>DestDir: "C:\..."</c>）的条目默认落入此类，
+	///     可通过 <see cref="OutputPathMapper" /> 将其映射到输出目录内。
+	/// </summary>
+	public event Action<InnoArchiveFile>? UnsafePathSkipped;
 
 	/// <summary>
 	///     并行提取的最大 chunk 组并发数（默认 1 = 串行）。
@@ -78,6 +88,9 @@ public sealed class ExtractionOptions {
 	internal void RaiseProgressChanged(ulong bytesExtracted, int filesExtracted, string? currentFileName) {
 		ProgressChanged?.Invoke(new(bytesExtracted, filesExtracted, currentFileName));
 	}
+
+	/// <summary>触发不安全路径跳过事件（提取引擎内部调用）。</summary>
+	internal void RaiseUnsafePathSkipped(InnoArchiveFile file) { UnsafePathSkipped?.Invoke(file); }
 }
 
 /// <summary>

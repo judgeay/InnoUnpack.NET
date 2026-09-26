@@ -124,6 +124,17 @@ archive.ExtractToDirectory("output", options);
   - `OutputPathMapper`（提取时）：逐文件条件化映射，作用于已展开路径，
     适合"个别文件重命名/分流"（如把某个 exe 单独输出到别的目录）；与 `FileFilter` 组合
     可实现"只提取 app 到指定文件夹"
+- 安装到绝对路径的条目（如 `DestDir: "C:\Data"`，`f.Path` 为 `C:\Data\...`）默认不提取
+  （绝不写出输出目录），并触发 `UnsafePathSkipped` 事件；`OutputPathMapper` 对这类条目同样调用，
+  可将其映射到输出目录内：
+
+```csharp
+options.UnsafePathSkipped += f => Console.WriteLine($"跳过：{f.Path}");
+// 例如 C:\Data\a.txt → C_\Data\a.txt（与 innounp 一致）
+options.OutputPathMapper = f => Path.IsPathRooted(f.Path) && f.Path.Length > 1 && f.Path[1] == ':'
+    ? f.Path[0] + "_" + f.Path[2..]
+    : null;
+```
 
 ## 加密安装包
 
